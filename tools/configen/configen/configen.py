@@ -1,18 +1,29 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import inspect
 import logging
 import os
 import pkgutil
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from textwrap import dedent
-from typing import Any, Dict, List, Optional, Set, Type
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Type,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+
+from jinja2 import Environment, PackageLoader, Template
 
 import hydra
-from jinja2 import Environment, PackageLoader, Template
 from omegaconf import OmegaConf, ValidationError
 from omegaconf._utils import (
     _is_union,
@@ -95,6 +106,7 @@ def is_incompatible(type_: Type[Any]) -> bool:
         return True
 
     type_ = opt[1]
+
     if type_ in (type(None), tuple, list, dict):
         return False
 
@@ -112,6 +124,15 @@ def is_incompatible(type_: Type[Any]) -> bool:
                 if arg is not ... and is_incompatible(arg):
                     return True
             return False
+        if get_origin(type_) is Callable:
+            args = get_args(type_)
+            for arg in args[0]:
+                if arg is not ... and is_incompatible(arg):
+                    return True
+            if is_incompatible(args[1]):
+                return True
+            return False
+
     except ValidationError:
         return True
 
@@ -164,12 +185,16 @@ def generate_module(cfg: ConfigenConf, module: ModuleConf) -> str:
     for class_name in module.classes:
         full_name = f"{module.name}.{class_name}"
         cls = hydra.utils.get_class(full_name)
-        sig = inspect.signature(cls)
         params: List[Parameter] = []
         params = params + default_flags
+        resolved_hints = get_type_hints(cls.__init__)
+        sig = inspect.signature(cls.__init__)
 
         for name, p in sig.parameters.items():
-            type_ = p.annotation
+            # Skip self as an attribute
+            if name == "self":
+                continue
+            type_ = type_cached = resolved_hints.get(name, p.annotation)
             default_ = p.default
 
             missing_value = default_ == sig.empty
@@ -177,7 +202,7 @@ def generate_module(cfg: ConfigenConf, module: ModuleConf) -> str:
                 type(default_)
             )
 
-            missing_annotation_type = type_ == sig.empty
+            missing_annotation_type = name not in resolved_hints
             incompatible_annotation_type = (
                 not missing_annotation_type and is_incompatible(type_)
             )
@@ -195,23 +220,19 @@ def generate_module(cfg: ConfigenConf, module: ModuleConf) -> str:
                     default_ = f"field(default_factory=lambda: {default_})"
 
             missing_default = missing_value
-            if (
-                incompatible_annotation_type
-                or incompatible_value_type
-                or missing_default
-            ):
+            if incompatible_value_type:
                 missing_default = True
 
             collect_imports(imports, type_)
 
             if missing_default:
-                if incompatible_annotation_type:
-                    default_ = f"MISSING  # {type_str(p.annotation)}"
-                elif incompatible_value_type:
-                    default_ = f"MISSING  # {type_str(type(p.default))}"
-                else:
-                    default_ = "MISSING"
+                default_ = "MISSING"
                 string_imports.add("from omegaconf import MISSING")
+
+            if incompatible_annotation_type:
+                default_ = f"{default_}  # {type_str(type_cached)}"
+            elif incompatible_value_type:
+                default_ = f"{default_}  # {type_str(type(p.default))}"
 
             params.append(
                 Parameter(
@@ -244,18 +265,19 @@ def main(cfg: Config):
 
     if OmegaConf.is_missing(cfg.configen, "modules"):  # type: ignore
         log.error(
-            dedent(
-                """\
-
-        Use --config-dir DIR --config-name NAME
-        e.g:
-        \tconfigen --config-dir conf --config-name configen
-
-        If you have no config dir yet use init_config_dir=DIR to create an initial config dir.
-        e.g:
-        \tconfigen init_config_dir=conf
-        """
-            )
+            "Use --config-dir DIR."
+            "\nIf you have no config dir yet use the following command to create an initial config in the `conf` dir:"
+            "\n\tconfigen init_config_dir=conf"
+        )
+        dedent(
+            """\
+            Use --config-dir DIR --config-name NAME
+            e.g:
+            \tconfigen --config-dir conf --config-name configen
+            If you have no config dir yet use init_config_dir=DIR to create an initial config dir.
+            e.g:
+            \tconfigen init_config_dir=conf
+            """
         )
         sys.exit(1)
 
